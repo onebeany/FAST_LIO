@@ -60,6 +60,9 @@
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 
+// New feature
+#include <sensor_msgs/CompressedImage.h>
+
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
 #define MAXN                (720000)
@@ -82,10 +85,10 @@ mutex mtx_buffer;
 condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
-string map_file_path, lid_topic, imu_topic;
+string map_file_path, lid_topic, imu_topic, img_topic;
 
 double res_mean_last = 0.05, total_residual = 0.0;
-double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
+double last_timestamp_lidar = 0, last_timestamp_imu = -1.0, last_timestamp_img = 0.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
@@ -93,7 +96,9 @@ int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count =
 int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
-bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
+bool   flg_first_pending_scan = true, flg_process_pending_scan_ongoing = false;
+bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false, sweep_reconstruction_en = false;
+
 
 vector<vector<int>>  pointSearchInd_surf; 
 vector<BoxPointType> cub_needrm;
@@ -103,6 +108,11 @@ vector<double>       extrinR(9, 0.0);
 deque<double>                     time_buffer;
 deque<PointCloudXYZI::Ptr>        lidar_buffer;
 deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
+
+
+// New feature
+deque<double>                     img_time_buffer;
+deque<PendingLidarData>           pending_lidar_buffer;
 
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
@@ -294,6 +304,7 @@ void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
+    cout << "Lidar scan count: " << scan_count << ", time: " << msg->header.stamp.toSec() << endl;
 }
 
 double timediff_lidar_wrt_imu = 0.0;
@@ -324,9 +335,16 @@ void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg)
 
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr);
-    lidar_buffer.push_back(ptr);
-    time_buffer.push_back(last_timestamp_lidar);
-    
+
+    if(sweep_reconstruction_en){
+        double end_ts = last_timestamp_lidar + ptr->points.back().curvature / double(1000);
+        pending_lidar_buffer.push_back({ptr, last_timestamp_lidar, end_ts});
+    }
+    else{
+        lidar_buffer.push_back(ptr);
+        time_buffer.push_back(last_timestamp_lidar);
+    }
+        
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
@@ -362,23 +380,205 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
     sig_buffer.notify_all();
 }
 
+void img_cbk(const sensor_msgs::CompressedImage::ConstPtr &msg)
+{   
+    mtx_buffer.lock();
+    if (msg->header.stamp.toSec() < last_timestamp_img)
+    {
+        ROS_ERROR("image loop back, clear buffer");
+        img_time_buffer.clear();
+    }
+    last_timestamp_img = msg->header.stamp.toSec();
+
+    img_time_buffer.push_back(last_timestamp_img);
+
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+}
+
+bool process_pending_lidar_data()
+{
+
+    mtx_buffer.lock();
+    if (pending_lidar_buffer.empty() || img_time_buffer.empty()) {
+        //cout << "pending_lidar_buffer is empty or img_time_buffer is empty" << endl;
+        mtx_buffer.unlock();
+        return false;
+    }
+
+    if(flg_first_pending_scan){
+        //cout << "process the first pending lidar data" << endl;
+        flg_first_pending_scan = false;
+        lidar_buffer.push_back(pending_lidar_buffer.front().cloud);
+        time_buffer.push_back(pending_lidar_buffer.front().start_ts);
+        mtx_buffer.unlock();
+        return true;
+    }
+    
+    if (pending_lidar_buffer.size() < 2) {
+        //cout << "Not enough pending lidar data" << endl;
+        mtx_buffer.unlock();
+        return false;
+    }
+
+    PendingLidarData curr_sweep = pending_lidar_buffer[1]; 
+    if(last_timestamp_img < curr_sweep.end_ts){
+        //cout << "last_timestamp_img < curr_sweep_end_ts" << endl;
+        mtx_buffer.unlock();
+        return false;
+    }
+    PendingLidarData prev_sweep = pending_lidar_buffer.front();
+    pending_lidar_buffer.pop_front(); // pop the previous sweep
+
+    deque<double> img_time_buffer_of_curr_sweep;
+    //cout << "[img_timestamp]: ";
+    while(!img_time_buffer.empty()) {
+        double curr_img_timestamp = img_time_buffer.front();
+        //cout << formatTimestamp(curr_img_timestamp) << " | ";
+        if (curr_img_timestamp < curr_sweep.start_ts) {
+            //cout << "curr_img_timestamp < curr_sweep.start_ts" << endl;
+            img_time_buffer.pop_front();
+        } 
+        else if(curr_img_timestamp <= curr_sweep.end_ts) {
+            //cout << formatTimestamp(curr_img_timestamp) << " | ";
+            //out << "curr_img_timestamp <= curr_sweep.end_ts" << endl;
+            img_time_buffer_of_curr_sweep.push_back(curr_img_timestamp);
+            img_time_buffer.pop_front();
+        } 
+        else {
+            break;
+        }
+    }
+    //cout << "end of making img_time_buffer_of_curr_sweep" << endl;
+
+
+    // Check if we have any image timestamps
+    if(!img_time_buffer_of_curr_sweep.empty()) {
+        // Segment the point cloud; segments is a pair of deque of point clouds and the start timestamp of each segment
+        // each segment should be combined with part of previous lidar scan
+        try {
+
+            // cout << "Segmenting the point cloud" << endl;
+
+            cout << "====================================================================================================" << endl;
+            deque<double> img_time_buffer_of_prev_sweep;
+            for(int i = 0; i < img_time_buffer_of_curr_sweep.size(); i++){
+                img_time_buffer_of_prev_sweep.push_back(img_time_buffer_of_curr_sweep[i] - p_pre->scan_duration);
+                cout << "prev_img_timestamp: " << formatTimestamp(img_time_buffer_of_prev_sweep[i]) << " | ";
+                cout << "curr_img_timestamp: " << formatTimestamp(img_time_buffer_of_curr_sweep[i]) << endl;
+            }
+            
+            
+            //cout << "[PREV SCAN]  | [" << formatTimestamp(prev_sweep.start_ts) << ", " << formatTimestamp(prev_sweep.end_ts) << "] | size: " << prev_sweep.cloud->points.size() << endl; 
+            //cout << "[PREV SWEEP] | ";
+            // For previous sweep, we only use segments which start timestamp is align with the img_timestmap - scan_duration
+            deque<pair<PointCloudXYZI::Ptr, double>> prev_segments = p_pre->segmentation(prev_sweep.cloud, prev_sweep.start_ts, img_time_buffer_of_prev_sweep);
+            prev_segments.pop_front(); 
+
+            //cout << "[CURR SCAN]  | [" << formatTimestamp(curr_sweep.start_ts) << ", " << formatTimestamp(curr_sweep.end_ts) << "] | size: " << curr_sweep.cloud->points.size() << endl;
+            //cout << "[CURR SWEEP] | ";
+            // For current sweep, we only use segments which end timestamp is align with the img_timestmap
+            deque<pair<PointCloudXYZI::Ptr, double>> curr_segments = p_pre->segmentation(curr_sweep.cloud, curr_sweep.start_ts, img_time_buffer_of_curr_sweep);
+            curr_segments.pop_back();
+
+            // cout << "combine the segments" << endl;
+            // For reference: prev_segments and curr_segments should have the same size
+            // Combine the segments
+            deque<pair<PointCloudXYZI::Ptr, double>> combined_segments;
+            combined_segments.insert(combined_segments.end(), prev_segments.begin(), prev_segments.end());
+            combined_segments.insert(combined_segments.end(), curr_segments.begin(), curr_segments.end());
+
+            int num_segments_per_sweep = curr_segments.size() + 1; 
+            int num_reconstructed_sweep = img_time_buffer_of_curr_sweep.size();
+
+            // out << "Reconstructing the sweep" << endl;
+            for(int i = 0; i < num_reconstructed_sweep; i++) {
+                PointCloudXYZI::Ptr reconstructed_sweep(new PointCloudXYZI());
+                
+                // 총 포인트 수를 미리 계산하여 메모리 할당
+                size_t total_points = 0;
+                for(int j = 0; j < num_segments_per_sweep; j++) {
+                    if(i+j < combined_segments.size()) {
+                        total_points += combined_segments[i+j].first->size();
+                    }
+                }
+                reconstructed_sweep->reserve(total_points);
+                
+                // 기준 시간 설정 (첫 번째 세그먼트의 시작 시간)
+                double base_timestamp = combined_segments[i].second;
+                
+                // 각 세그먼트 처리
+                for(int j = 0; j < num_segments_per_sweep; j++) {
+                    if(i+j < combined_segments.size()) {
+                        // 현재 세그먼트의 시작 시간과 기준 시간의 차이 (ms 단위로 변환)
+                        double time_offset_ms = (combined_segments[i+j].second - base_timestamp) * 1000.0;
+                        
+                        
+                        // 세그먼트의 모든 포인트 복사 및 curvature 조정
+                        for(const auto& point : combined_segments[i+j].first->points) {
+                            pcl::PointXYZINormal adjusted_point = point;
+                            // curvature 값을 조정 (기존 값 + 세그먼트 시간 차이)
+                            adjusted_point.curvature += time_offset_ms;
+                            reconstructed_sweep->points.push_back(adjusted_point);
+                        }
+                    }
+                }
+                
+                // 포인트 클라우드 크기 업데이트
+                reconstructed_sweep->width = reconstructed_sweep->points.size();
+                reconstructed_sweep->height = 1;
+                reconstructed_sweep->is_dense = true;
+                
+                // 결과 출력 및 버퍼에 추가
+                cout << "Reconstructed sweep[" << i << "]\t| [" << formatTimestamp(base_timestamp) << \
+                    ", " << formatTimestamp(base_timestamp + reconstructed_sweep->points.back().curvature / double(1000)) << \
+                    "] | size: " << reconstructed_sweep->points.size() << endl;
+                    
+                lidar_buffer.push_back(reconstructed_sweep);
+                time_buffer.push_back(base_timestamp);
+            }
+            cout << "Original sweep\t\t| [" << formatTimestamp(curr_sweep.start_ts) << \
+                                  ", " << formatTimestamp(curr_sweep.end_ts) << \
+                                  "] | size: " << curr_sweep.cloud->points.size() <<    endl;
+            cout << "====================================================================================================" << endl;
+            lidar_buffer.push_back(curr_sweep.cloud);
+            time_buffer.push_back(curr_sweep.start_ts);
+            //cout << "Reconstruction done" << endl;
+        } catch(...) {
+            lidar_buffer.push_back(curr_sweep.cloud);
+            time_buffer.push_back(curr_sweep.start_ts);
+        }
+    }
+    else {
+        // No image timestamps available, use default behavior
+        lidar_buffer.push_back(curr_sweep.cloud);
+        time_buffer.push_back(curr_sweep.start_ts);
+    }
+
+    mtx_buffer.unlock();
+    return true;
+}
+
 double lidar_mean_scantime = 0.0;
 int    scan_num = 0;
 bool sync_packages(MeasureGroup &meas)
 {
+    //cout << "get into sync_packages" << endl;
     if (lidar_buffer.empty() || imu_buffer.empty()) {
+        //cout << "sync package - waiting for data" << endl;
         return false;
     }
 
     /*** push a lidar scan ***/
     if(!lidar_pushed)
     {
+        cout << "\nlidar scan[" << scan_num << "] pushed" << endl; 
         meas.lidar = lidar_buffer.front();
         meas.lidar_beg_time = time_buffer.front();
         if (meas.lidar->points.size() <= 1) // time too little
         {
             lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
-            ROS_WARN("Too few input point cloud!\n");
+            ROS_WARN("Too few input piont cloud!\n");
         }
         else if (meas.lidar->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime)
         {
@@ -394,27 +594,81 @@ bool sync_packages(MeasureGroup &meas)
         meas.lidar_end_time = lidar_end_time;
 
         lidar_pushed = true;
+        //cout << "done of pushing lidar scan" << endl;
     }
-
+    
     if (last_timestamp_imu < lidar_end_time)
     {
+        //cout << "sync package - waiting for imu data" << endl;
         return false;
     }
 
-    /*** push imu data, and pop from imu buffer ***/
-    double imu_time = imu_buffer.front()->header.stamp.toSec();
-    meas.imu.clear();
-    while ((!imu_buffer.empty()) && (imu_time < lidar_end_time))
-    {
-        imu_time = imu_buffer.front()->header.stamp.toSec();
-        if(imu_time > lidar_end_time) break;
-        meas.imu.push_back(imu_buffer.front());
-        imu_buffer.pop_front();
+    // For handling delyaed lidar data 
+    // TODO: How to handle the last scan?
+    if(lidar_buffer.size() < 2 || time_buffer.size() < 2){
+        //cout << "sync package - waiting for next lidar data" << endl;
+        return false;
     }
 
+
+    // There is two case when the lidar buffer is empty: 1. It is the last scan 2. The next scan is not ready
+    // How can we distinguish these two cases?
+    double next_lidar_time = time_buffer[1];
+    //cout << "current_lidar_time: " << formatTimestamp(meas.lidar_beg_time) << " || current_lidar_end_time: " << formatTimestamp(lidar_end_time) << endl;
+    //cout << "next_lidar_time: " << formatTimestamp(next_lidar_time) << endl;
+
+    // FOR TEST
+    PointCloudXYZI::Ptr next_lidar = lidar_buffer[1];
+    int iter_size = min(next_lidar->size(), meas.lidar->size());
+    int next_lidar_idx = 0;
+    cout << "initial point time\t\t" << formatTimestamp(meas.lidar_beg_time + meas.lidar->points[0].curvature/double(1000)) << "\t start: " << formatTimestamp(meas.lidar_beg_time) << " | offset: " << formatTimestamp(meas.lidar->points[0].curvature/double(1000)) << endl;
+    cout << "Very before the end point time\t" << formatTimestamp(meas.lidar_beg_time + meas.lidar->points[meas.lidar->size()-2].curvature/double(1000)) << "\t start: " << formatTimestamp(meas.lidar_beg_time) << " | offset: " << formatTimestamp(meas.lidar->points[meas.lidar->size()-2].curvature/double(1000)) << endl;
+    cout << "End point time\t\t" << formatTimestamp(lidar_end_time) << "\t start: " << formatTimestamp(meas.lidar_beg_time) << " | offset: " << formatTimestamp(meas.lidar->points[meas.lidar->size()-1].curvature/double(1000)) << endl;
+    cout << "Next lidar point time\t\t" << formatTimestamp(next_lidar_time) << endl;
+    for(int i = 0 ; i < meas.lidar->size(); i++){
+        cout << "=============================================================\n";
+        if(meas.lidar_beg_time + meas.lidar->points[i].curvature/double(1000) == next_lidar_time + next_lidar->points[next_lidar_idx].curvature/double(1000)){
+            cout << "same time: curr lidar point[" << i << "] | next lidar point[" << next_lidar_idx << "]" << endl;
+            cout << "curr lidar point: " << meas.lidar->points[i].x << " " << meas.lidar->points[i].y << " " << meas.lidar->points[i].z << endl;
+            cout << "next lidar point: " << next_lidar->points[next_lidar_idx].x << " " << next_lidar->points[next_lidar_idx].y << " " << next_lidar->points[next_lidar_idx].z << endl;
+            next_lidar_idx++;
+        }
+        if(meas.lidar->points[i].x == next_lidar->points[next_lidar_idx].x && meas.lidar->points[i].y == next_lidar->points[next_lidar_idx].y && meas.lidar->points[i].z == next_lidar->points[next_lidar_idx].z){
+            cout << "same point: curr lidar point[" << i << "] | next lidar point[" << next_lidar_idx << "]" << endl;
+            cout << "curr point time " << formatTimestamp(meas.lidar_beg_time + meas.lidar->points[i].curvature/double(1000)) << "\t start: " << formatTimestamp(meas.lidar_beg_time) << " | offset: " << formatTimestamp(meas.lidar->points[i].curvature/double(1000)) << endl;
+            cout << "next point time " << formatTimestamp(next_lidar_time + next_lidar->points[next_lidar_idx].curvature/double(1000)) << "\t start: " << formatTimestamp(next_lidar_time) << " | offset: " << formatTimestamp(next_lidar->points[next_lidar_idx].curvature/double(1000)) << endl;
+            next_lidar_idx++;
+        }
+        else{
+            cout << "point[" << i << "] time " << formatTimestamp(meas.lidar_beg_time + meas.lidar->points[i].curvature/double(1000)) << "\t start: " << formatTimestamp(meas.lidar_beg_time) << " | offset: " << formatTimestamp(meas.lidar->points[i].curvature/double(1000)) << endl;
+            continue;
+        }
+    }
+
+    /*** push imu data, and pop from imu buffer ***/
+    deque<sensor_msgs::Imu::ConstPtr> imu_buffer_of_curr_sweep = imu_buffer;
+    double imu_time = imu_buffer_of_curr_sweep.front()->header.stamp.toSec();
+    meas.imu.clear();
+
+    while ((!imu_buffer_of_curr_sweep.empty()) && (imu_time < lidar_end_time))
+    { 
+        imu_time = imu_buffer_of_curr_sweep.front()->header.stamp.toSec();
+        if(imu_time > lidar_end_time) break;
+        meas.imu.push_back(imu_buffer_of_curr_sweep.front());
+        imu_buffer_of_curr_sweep.pop_front();
+        if(imu_time < next_lidar_time) imu_buffer.pop_front();
+        //imu_buffer.pop_front();
+    }
+    cout << "=========================================================" << endl;
+    cout << "imu data pushed for lidar scan[" << scan_num-1 << "]" << endl;
+    cout << "LiDAR time range: \t[" << formatTimestamp(meas.lidar_beg_time) << ", " << formatTimestamp(lidar_end_time) << "]" << endl;
+    cout << "IMU time range: \t[" << formatTimestamp(meas.imu.front()->header.stamp.toSec()) << ", " << formatTimestamp(meas.imu.back()->header.stamp.toSec()) << "]" << endl;
+    cout << "========================================================\n" << endl;
+    // cout << "done of pushing imu data" << endl;
     lidar_buffer.pop_front();
     time_buffer.pop_front();
     lidar_pushed = false;
+    // cout << "done of sync package" << endl;
     return true;
 }
 
@@ -788,6 +1042,11 @@ int main(int argc, char** argv)
     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
     cout<<"p_pre->lidar_type "<<p_pre->lidar_type<<endl;
     
+    // New feature
+    nh.param<string>("common/img_topic", img_topic, "/go1_d435/depth/image_rect_raw/compressed");
+    nh.param<bool>("common/sweep_reconstruction_en", sweep_reconstruction_en, false);
+    nh.param<double>("preprocess/scan_duration", p_pre->scan_duration, 0.1);
+
     path.header.stamp    = ros::Time::now();
     path.header.frame_id ="camera_init";
 
@@ -839,6 +1098,10 @@ int main(int argc, char** argv)
         nh.subscribe(lid_topic, 200000, livox_pcl_cbk) : \
         nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
     ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
+
+    //New feature
+    ros::Subscriber sub_img = nh.subscribe(img_topic, 200000, img_cbk);
+    
     ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>
             ("/cloud_registered", 100000);
     ros::Publisher pubLaserCloudFull_body = nh.advertise<sensor_msgs::PointCloud2>
@@ -856,11 +1119,18 @@ int main(int argc, char** argv)
     ros::Rate rate(5000);
     bool status = ros::ok();
     while (status)
-    {
+    {   
         if (flg_exit) break;
         ros::spinOnce();
+        
+        if(sweep_reconstruction_en){
+            if(!process_pending_lidar_data()){ // For synchronization with img timestamp
+                continue;
+            }
+        }
+
         if(sync_packages(Measures)) 
-        {
+        {   
             if (flg_first_scan)
             {
                 first_lidar_time = Measures.lidar_beg_time;

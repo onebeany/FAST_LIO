@@ -153,6 +153,12 @@ struct StatesGroup
     Matrix<double, DIM_STATE, DIM_STATE>  cov;     // states covariance
 };
 
+struct PendingLidarData {
+    PointCloudXYZI::Ptr cloud;
+    double start_ts;
+    double end_ts;
+};
+
 template<typename T>
 T rad2deg(T radians)
 {
